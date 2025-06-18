@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>مشاهدة جماعية | شبيه Rave</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Cairo', sans-serif;
+        }
+        .video-container {
+            position: relative;
+            padding-bottom: 56.25%; /* 16:9 Aspect Ratio */
+            height: 0;
+            overflow: hidden;
+            max-width: 100%;
+            background: #000;
+        }
+        .video-container iframe,
+        .video-container video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .controls-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            z-index: 2;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+    <!-- Firestore and Firebase Auth -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, addDoc, query, orderBy, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES ---
+        let db, auth;
+        let userId, roomId;
+        let youtubePlayer;
+        let isLocalChange = false; // Flag to prevent feedback loops
+        let roomUnsubscribe, chatUnsubscribe;
+        let isHost = false;
+
+        // --- DOM ELEMENTS ---
+        const lobbyView = document.getElementById('lobbyView');
+        const roomView = document.getElementById('roomView');
+        const createRoomBtn = document.getElementById('createRoomBtn');
+        const joinRoomInput = document.getElementById('joinRoomInput');
+        const joinRoomBtn = document.getElementById('joinRoomBtn');
+        const roomIdDisplay = document.getElementById('roomIdDisplay');
+        const currentUserIdDisplay = document.getElementById('currentUserIdDisplay');
+        const videoUrlInput = document.getElementById('videoUrlInput');
+        const setVideoBtn = document.getElementById('setVideoBtn');
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const chatForm = document.getElementById('chatForm');
+        const youtubePlayerEl = document.getElementById('youtubePlayer');
+        const mp4PlayerEl = document.getElementById('mp4Player');
+        const copyRoomIdBtn = document.getElementById('copyRoomIdBtn');
+        const copyUserIdBtn = document.getElementById('copyUserIdBtn');
+        const messageBox = document.getElementById('messageBox');
+        const messageText = document.getElementById('messageText');
+        const closeMessageBtn = document.getElementById('closeMessageBtn');
+        const playerContainer = document.querySelector('.video-container');
+
+        // --- YOUTUBE API SETUP ---
+        const tag = document.createElement('script');
+        tag.src = "https://www.youtube.com/iframe_api";
+        const firstScriptTag = document.getElementsByTagName('script')[0];
+        firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+        
+        // This function will be called by the YouTube API
+        window.onYouTubeIframeAPIReady = function() {
+            // Player will be initialized when a room is joined
+        };
+        
+        function initializeYoutubePlayer(isHostPlayer) {
+            const playerVars = isHostPlayer ? { 'controls': 1 } : { 'controls': 0, 'disablekb': 1, 'modestbranding': 1, 'showinfo': 0 };
+             if (youtubePlayer) {
+                youtubePlayer.destroy();
+            }
+            youtubePlayer = new YT.Player('youtubePlayer', {
+                height: '100%',
+                width: '100%',
+                playerVars: playerVars,
+                events: {
+                    'onStateChange': onPlayerStateChange
+                }
+            });
+        }
+
+        // --- FIREBASE INITIALIZATION ---
+        async function initializeFirebase() {
+            try {
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-rave-clone';
+                
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        currentUserIdDisplay.textContent = userId;
+                        lobbyView.classList.remove('hidden');
+
+                        // Enable controls now that auth is ready
+                        createRoomBtn.disabled = false;
+                        createRoomBtn.textContent = '🚀 إنشاء غرفة جديدة';
+                        joinRoomInput.disabled = false;
+                        joinRoomBtn.disabled = false;
+
+                    } else {
+                        // Sign in flow
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                showMessage("فشل في تهيئة الخدمات. يرجى تحديث الصفحة.");
+            }
+        }
+
+        // --- UI & MESSAGING ---
+        function showMessage(msg, isError = false) {
+            messageText.textContent = msg;
+            messageBox.classList.remove('hidden');
+            messageBox.classList.toggle('bg-red-500', isError);
+            messageBox.classList.toggle('bg-blue-500', !isError);
+            setTimeout(() => { messageBox.classList.add('hidden') }, 3000);
+        }
+        
+        closeMessageBtn.addEventListener('click', () => messageBox.classList.add('hidden'));
+
+        function copyToClipboard(text, element) {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+            
+            const originalText = element.textContent;
+            element.textContent = 'تم النسخ!';
+            setTimeout(() => {
+                element.textContent = originalText;
+            }, 2000);
+        }
+
+        copyRoomIdBtn.addEventListener('click', () => copyToClipboard(roomId, copyRoomIdBtn.querySelector('code')));
+        copyUserIdBtn.addEventListener('click', () => copyToClipboard(userId, copyUserIdBtn.querySelector('code')));
+
+        function leaveRoom() {
+            if (roomUnsubscribe) roomUnsubscribe();
+            if (chatUnsubscribe) chatUnsubscribe();
+            roomUnsubscribe = null;
+            chatUnsubscribe = null;
+            roomId = null;
+            isHost = false;
+            
+            if(youtubePlayer && typeof youtubePlayer.stopVideo === 'function') youtubePlayer.stopVideo();
+            if(mp4PlayerEl) { mp4PlayerEl.pause(); mp4PlayerEl.removeAttribute('src'); mp4PlayerEl.load(); }
+
+            roomView.classList.add('hidden');
+            lobbyView.classList.remove('hidden');
+            chatMessages.innerHTML = '';
+            videoUrlInput.value = '';
+            joinRoomInput.value = '';
+        }
+        
+        function updateUiForRole() {
+            videoUrlInput.disabled = !isHost;
+            setVideoBtn.disabled = !isHost;
+            mp4PlayerEl.controls = isHost;
+            
+            const overlay = document.getElementById('controlsOverlay');
+            if (!isHost && !overlay) {
+                const newOverlay = document.createElement('div');
+                newOverlay.id = 'controlsOverlay';
+                newOverlay.className = 'controls-overlay';
+                playerContainer.appendChild(newOverlay);
+            } else if (isHost && overlay) {
+                overlay.remove();
+            }
+
+            if (!isHost) {
+                 videoUrlInput.placeholder = "المضيف فقط يمكنه تغيير الفيديو";
+            } else {
+                 videoUrlInput.placeholder = "الصق رابط يوتيوب أو .mp4 هنا...";
+            }
+        }
+
+        // --- ROOM MANAGEMENT ---
+        createRoomBtn.addEventListener('click', () => {
+            const newRoomId = crypto.randomUUID().substring(0, 6).toUpperCase();
+            isHost = true;
+            joinRoom(newRoomId, true);
+        });
+
+        joinRoomBtn.addEventListener('click', () => {
+            const idToJoin = joinRoomInput.value.trim().toUpperCase();
+            if (idToJoin) {
+                isHost = false;
+                joinRoom(idToJoin, false);
+            } else {
+                showMessage("الرجاء إدخال رمز الغرفة", true);
+            }
+        });
+
+        async function joinRoom(newRoomId, isCreating) {
+            if (!userId) {
+                showMessage("خطأ: لم يتم تحديد المستخدم. يرجى المحاولة مرة أخرى.", true);
+                return;
+            }
+
+            roomId = newRoomId;
+            const roomRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-rave-clone'}/public/data/rooms`, roomId);
+
+            try {
+                if(isCreating) {
+                    await setDoc(roomRef, { videoUrl: "", isPlaying: false, currentTime: 0, lastUpdated: serverTimestamp(), host: userId });
+                } else {
+                    const roomSnap = await getDoc(roomRef);
+                    if (!roomSnap.exists()) { showMessage("الغرفة غير موجودة. تحقق من الرمز.", true); return; }
+                    isHost = roomSnap.data().host === userId;
+                }
+                
+                lobbyView.classList.add('hidden');
+                roomView.classList.remove('hidden');
+                roomIdDisplay.textContent = roomId;
+                
+                initializeYoutubePlayer(isHost);
+
+                subscribeToRoomUpdates(roomRef);
+                subscribeToChatUpdates();
+
+            } catch (error) {
+                console.error("Error joining room:", error);
+                showMessage("حدث خطأ أثناء الانضمام للغرفة.", true);
+            }
+        }
+        
+        // --- REAL-TIME SYNCHRONIZATION ---
+        function subscribeToRoomUpdates(roomRef) {
+            if (roomUnsubscribe) roomUnsubscribe();
+            
+            roomUnsubscribe = onSnapshot(roomRef, (docSnap) => {
+                if (!docSnap.exists()) { showMessage("تم إغلاق الغرفة أو حذفها.", true); leaveRoom(); return; }
+                const data = docSnap.data();
+                
+                isHost = data.host === userId;
+                updateUiForRole();
+
+                if (isLocalChange) { isLocalChange = false; return; }
+                
+                if (data.videoUrl && (youtubePlayer?.getVideoUrl()?.indexOf(parseYoutubeUrl(data.videoUrl) || '---') === -1 && mp4PlayerEl.src !== data.videoUrl)) {
+                    loadVideo(data.videoUrl);
+                }
+                syncPlayerState(data);
+            });
+        }
+        
+        function syncPlayerState(data) {
+            const activePlayerIsMp4 = mp4PlayerEl.style.display !== 'none';
+
+            // Sync Play/Pause
+            if (activePlayerIsMp4) {
+                 if (data.isPlaying && mp4PlayerEl.paused) {
+                    const playPromise = mp4PlayerEl.play();
+                    if (playPromise !== undefined) {
+                        playPromise.catch(error => { if (error.name !== 'AbortError') { console.error("Playback error:", error); } });
+                    }
+                } else if (!data.isPlaying && !mp4PlayerEl.paused) {
+                    mp4PlayerEl.pause();
+                }
+                 // Sync Time
+                if (Math.abs(data.currentTime - mp4PlayerEl.currentTime) > 1.5) {
+                    mp4PlayerEl.currentTime = data.currentTime;
+                }
+            } else if (youtubePlayer && typeof youtubePlayer.getPlayerState === 'function') {
+                const playerState = youtubePlayer.getPlayerState();
+                if (data.isPlaying && playerState !== YT.PlayerState.PLAYING) {
+                    youtubePlayer.playVideo();
+                } else if (!data.isPlaying && playerState === YT.PlayerState.PLAYING) {
+                    youtubePlayer.pauseVideo();
+                }
+                 // Sync Time
+                 if (Math.abs(data.currentTime - (youtubePlayer.getCurrentTime() || 0)) > 1.5) {
+                    youtubePlayer.seekTo(data.currentTime, true);
+                }
+            }
+        }
+
+        async function updateRoomState(newState) {
+            if (!isHost) return;
+            isLocalChange = true;
+            const roomRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-rave-clone'}/public/data/rooms`, roomId);
+            try {
+                await setDoc(roomRef, { ...newState, lastUpdated: serverTimestamp() }, { merge: true });
+            } catch (error) { console.error("Error updating room state:", error); }
+        }
+        
+        // --- VIDEO PLAYER LOGIC ---
+        setVideoBtn.addEventListener('click', () => {
+            if (!isHost) return;
+            const url = videoUrlInput.value.trim();
+            if (url) {
+                updateRoomState({ videoUrl: url, currentTime: 0, isPlaying: true });
+            }
+        });
+
+        function loadVideo(url) {
+            videoUrlInput.value = url;
+            const youtubeId = parseYoutubeUrl(url);
+            if (youtubeId) {
+                youtubePlayerEl.style.display = 'block';
+                mp4PlayerEl.style.display = 'none';
+                youtubePlayer.loadVideoById(youtubeId);
+                youtubePlayer.playVideo();
+            } else if (url.endsWith('.mp4')) {
+                youtubePlayerEl.style.display = 'none';
+                mp4PlayerEl.style.display = 'block';
+                if(mp4PlayerEl.src !== url) { mp4PlayerEl.src = url; }
+                mp4PlayerEl.load();
+            } else {
+                showMessage("رابط غير مدعوم. يرجى استخدام رابط يوتيوب أو رابط mp4 مباشر.", true);
+            }
+        }
+
+        function parseYoutubeUrl(url) {
+            const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+            const match = url.match(regExp);
+            return (match && match[2].length === 11) ? match[2] : null;
+        }
+
+        function onPlayerStateChange(event) {
+            if (!isHost) return;
+            if (event.data === YT.PlayerState.PLAYING) {
+                updateRoomState({ isPlaying: true, currentTime: youtubePlayer.getCurrentTime() });
+            } else if (event.data === YT.PlayerState.PAUSED) {
+                updateRoomState({ isPlaying: false, currentTime: youtubePlayer.getCurrentTime() });
+            }
+        }
+        
+        // Host-only event listeners
+        mp4PlayerEl.addEventListener('play', () => updateRoomState({ isPlaying: true, currentTime: mp4PlayerEl.currentTime }));
+        mp4PlayerEl.addEventListener('pause', () => updateRoomState({ isPlaying: false, currentTime: mp4PlayerEl.currentTime }));
+        mp4PlayerEl.addEventListener('seeked', () => updateRoomState({ currentTime: mp4PlayerEl.currentTime }));
+
+        // --- CHAT LOGIC ---
+        function subscribeToChatUpdates() {
+            if(chatUnsubscribe) chatUnsubscribe();
+            const chatCollRef = collection(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-rave-clone'}/public/data/rooms`, roomId, 'messages');
+            const q = query(chatCollRef, orderBy('timestamp'));
+
+            chatUnsubscribe = onSnapshot(q, (snapshot) => {
+                chatMessages.innerHTML = '';
+                snapshot.forEach(doc => {
+                    const msg = doc.data();
+                    const time = msg.timestamp?.toDate()?.toLocaleTimeString('ar-SA', { hour: '2-digit', minute: '2-digit' }) || '';
+                    const messageElement = document.createElement('div');
+                    messageElement.classList.add('p-2', 'rounded-lg', 'mb-2', 'max-w-xs', 'break-words');
+                    if (msg.userId === userId) {
+                        messageElement.classList.add('bg-blue-600', 'self-end', 'mr-auto');
+                        messageElement.innerHTML = `<p class="text-white">${msg.text}</p><div class="text-xs text-blue-200 text-left mt-1">${time}</div>`;
+                    } else {
+                        const isMsgFromHost = msg.userId === (isHost ? userId : null); // A bit tricky, need room data
+                        messageElement.classList.add('bg-gray-700', 'self-start', 'ml-auto');
+                        messageElement.innerHTML = `<p class="font-bold text-gray-300 text-sm truncate">${msg.userId.substring(0,8)}</p><p class="text-white">${msg.text}</p><div class="text-xs text-gray-400 text-left mt-1">${time}</div>`;
+                    }
+                    chatMessages.appendChild(messageElement);
+                });
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            });
+        }
+        
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const text = chatInput.value.trim();
+            if(text && roomId && userId) {
+                const chatCollRef = collection(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-rave-clone'}/public/data/rooms`, roomId, 'messages');
+                try {
+                    await addDoc(chatCollRef, { text: text, userId: userId, timestamp: serverTimestamp() });
+                    chatInput.value = '';
+                } catch (error) { console.error("Error sending message: ", error); showMessage("فشل إرسال الرسالة.", true); }
+            }
+        });
+
+        window.onload = initializeFirebase;
+    </script>
+    
+    <div id="messageBox" class="hidden fixed top-5 right-5 z-50 p-4 rounded-md text-white shadow-lg">
+        <p id="messageText"></p>
+        <button id="closeMessageBtn" class="absolute top-1 right-2 text-xl">&times;</button>
+    </div>
+
+    <div id="lobbyView" class="min-h-screen flex flex-col items-center justify-center p-4">
+        <div class="text-center mb-8">
+            <h1 class="text-5xl font-bold mb-2">مرحباً في حفلة المشاهدة!</h1>
+            <p class="text-gray-400">شاهد الفيديوهات مع أصدقائك في نفس الوقت.</p>
+        </div>
+        <div class="bg-gray-800 p-8 rounded-lg shadow-2xl w-full max-w-md">
+            <h2 class="text-2xl font-semibold text-center mb-6">ابدأ الآن</h2>
+            <button id="createRoomBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition duration-300 mb-6 text-lg disabled:bg-blue-800 disabled:cursor-wait" disabled>جاري التحميل...</button>
+            <div class="flex items-center my-4">
+                <hr class="flex-grow border-gray-600"><span class="px-4 text-gray-500">أو</span><hr class="flex-grow border-gray-600">
+            </div>
+            <div class="flex flex-col sm:flex-row gap-2">
+                <input id="joinRoomInput" type="text" placeholder="أدخل رمز الغرفة..." class="flex-grow bg-gray-700 text-white placeholder-gray-400 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500" disabled>
+                <button id="joinRoomBtn" class="bg-gray-600 hover:bg-gray-500 text-white font-bold py-3 px-6 rounded-lg transition duration-300 disabled:bg-gray-700 disabled:cursor-wait" disabled>انضمام</button>
+            </div>
+        </div>
+        <div class="mt-8 bg-gray-800/50 p-3 rounded-lg flex items-center gap-4 text-sm">
+             <span class="text-gray-400">معرف المستخدم الخاص بك:</span>
+             <code id="currentUserIdDisplay" class="text-blue-400">Loading...</code>
+             <button id="copyUserIdBtn" class="text-gray-400 hover:text-white" title="نسخ معرف المستخدم"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg></button>
+        </div>
+    </div>
+
+    <div id="roomView" class="hidden">
+        <div class="flex flex-col lg:flex-row h-screen">
+            <main class="flex-grow flex flex-col bg-gray-900">
+                <div class="bg-gray-800 p-3 flex flex-col sm:flex-row items-center gap-3">
+                    <div class="flex items-center gap-2">
+                         <span class="text-gray-400">رمز الغرفة:</span>
+                         <code id="roomIdDisplay" class="bg-gray-700 text-blue-300 px-2 py-1 rounded"></code>
+                         <button id="copyRoomIdBtn" class="text-gray-400 hover:text-white" title="نسخ رمز الغرفة"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M10.854 7.146a.5.5 0 0 1 0 .708l-3 3a.5.5 0 0 1-.708 0l-1.5-1.5a.5.5 0 1 1 .708-.708L7.5 9.793l2.646-2.647a.5.5 0 0 1 .708 0z"/><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg></button>
+                    </div>
+                     <div class="flex-grow flex gap-2">
+                        <input id="videoUrlInput" type="text" placeholder="الصق رابط يوتيوب أو .mp4 هنا..." class="w-full bg-gray-700 text-white placeholder-gray-400 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-800 disabled:cursor-not-allowed">
+                        <button id="setVideoBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300 disabled:bg-gray-500 disabled:cursor-not-allowed">تشغيل</button>
+                    </div>
+                </div>
+                <div class="flex-grow bg-black flex items-center justify-center">
+                    <div class="video-container w-full">
+                       <div id="youtubePlayer"></div>
+                       <video id="mp4Player" class="hidden"></video>
+                       <!-- Overlay will be added here by JS for non-hosts -->
+                    </div>
+                </div>
+            </main>
+
+            <aside class="w-full lg:w-80 bg-gray-800 flex flex-col h-1/2 lg:h-full flex-shrink-0">
+                <h2 class="text-xl font-bold p-4 border-b border-gray-700">الدردشة</h2>
+                <div id="chatMessages" class="flex-grow p-4 overflow-y-auto flex flex-col"></div>
+                <form id="chatForm" class="p-4 border-t border-gray-700">
+                    <div class="flex gap-2">
+                        <input id="chatInput" type="text" placeholder="اكتب رسالتك..." autocomplete="off" class="flex-grow bg-gray-700 text-white rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        <button type="submit" class="bg-blue-600 hover:bg-blue-700 p-2 rounded-lg"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-white"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg></button>
+                    </div>
+                </form>
+            </aside>
+        </div>
+    </div>
+</body>
+</html>
